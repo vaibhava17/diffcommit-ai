@@ -24,4 +24,4 @@ Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Groq, OpenRouter, Ollama (loc
 - Diff capped at 60k chars
 - Icon: `images/icon.png` (256px, source `images/icon.svg`)
 - Never commit/push/publish here - user reviews + commits themselves
-- CI: `.github/workflows/publish.yml` publishes on push to master when version changed to VS Marketplace (`VSCE_PAT`) + Open VSX (`OVSX_PAT`, optional)
+- CI: `.github/workflows/publish.yml` manual dispatch only for now (push trigger commented); publishes when version changed to VS Marketplace (`VSCE_PAT`) + Open VSX (`OVSX_PAT`, optional)

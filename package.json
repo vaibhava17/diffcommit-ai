@@ -2,7 +2,7 @@
   "name": "ai-commit-msg",
   "displayName": "DiffCommit AI — Multi-Provider Commit Messages",
   "description": "Generate commit messages from git diff using AI — Claude, OpenAI, Gemini, DeepSeek, Grok, Mistral, Groq, OpenRouter, Ollama",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "vaibhava17",
   "icon": "images/icon.png",
   "galleryBanner": {

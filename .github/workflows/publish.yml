@@ -1,9 +1,8 @@
 name: Publish extension
 
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
+  # enable auto-publish later: add `push: {branches: [master]}` + secrets VSCE_PAT / OVSX_PAT
 
 permissions:
   contents: read

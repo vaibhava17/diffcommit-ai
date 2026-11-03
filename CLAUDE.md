@@ -22,4 +22,6 @@ Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Groq, OpenRouter, Ollama (loc
 
 - Display name "AI Commit Message" was taken — do not rename back
 - Diff capped at 60k chars
-- TODO: icon PNG, Open VSX publish
+- Icon: `images/icon.png` (256px, source `images/icon.svg`)
+- Never commit/push/publish here - user reviews + commits themselves
+- CI: `.github/workflows/publish.yml` publishes on push to master when version changed to VS Marketplace (`VSCE_PAT`) + Open VSX (`OVSX_PAT`, optional)

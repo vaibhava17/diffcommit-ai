@@ -1,0 +1,53 @@
+name: Publish extension
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check if version already published
+        id: check
+        run: |
+          LOCAL=$(node -p "require('./package.json').version")
+          REMOTE=$(npx --yes @vscode/vsce show vaibhava17.ai-commit-msg --json 2>/dev/null \
+            | node -p "try{JSON.parse(require('fs').readFileSync(0,'utf8')).versions[0].version}catch{''}")
+          echo "local=$LOCAL remote=$REMOTE"
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$LOCAL already on marketplace, bump version in package.json to publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Syntax check
+        if: steps.check.outputs.skip == 'false'
+        run: node --check extension.js
+
+      - name: Package
+        if: steps.check.outputs.skip == 'false'
+        run: npx --yes @vscode/vsce package -o ext.vsix
+
+      - name: Publish to VS Marketplace
+        if: steps.check.outputs.skip == 'false'
+        run: npx --yes @vscode/vsce publish -i ext.vsix
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Publish to Open VSX
+        if: steps.check.outputs.skip == 'false' && env.OVSX_PAT != ''
+        run: npx --yes ovsx publish ext.vsix -p "$OVSX_PAT"
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}

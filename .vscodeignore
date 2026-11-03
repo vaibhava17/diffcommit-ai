@@ -2,3 +2,8 @@ node_modules/**
 package-lock.json
 .gitignore
 **/*.vsix
+images/icon.svg
+CLAUDE.md
+.claude/**
+images/icon-source.jpg
+.github/**

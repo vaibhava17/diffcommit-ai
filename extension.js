@@ -73,19 +73,25 @@ const PROVIDERS = {
   },
 };
 
-const MAX_DIFF_CHARS = 60000;
+const MAX_TOKENS = 1024;
+const REQUEST_TIMEOUT_MS = 90_000;
 
-const PROMPT =
-  "Generate exactly ONE git commit message from the diff. " +
-  "Use Conventional Commits format: <type>: <description>. " +
-  "Allowed types: feat, fix, refactor, perf, docs, test, build, ci, chore, style, revert. " +
-  "Choose the type based on the primary purpose of the change. " +
-  "Use imperative mood. Describe the meaningful change, not implementation details. " +
-  "Do not invent changes. If multiple changes exist, choose the most significant one. " +
-  "The ENTIRE commit message must be 20 to 72 characters, including type, colon, spaces, and punctuation. " +
-  "Keep it concise rather than exceeding the limit. " +
-  "Return ONLY the commit message on a single line, with no quotes or explanation.\n\n" +
-  "Diff:\n";
+const SYSTEM_PROMPT =
+  "You write git commit messages from diffs.\n" +
+  "Rules:\n" +
+  "- Subject line uses Conventional Commits: <type>(<optional scope>): <description>.\n" +
+  "- Allowed types: feat, fix, refactor, perf, docs, test, build, ci, chore, style, revert.\n" +
+  "- Subject is imperative mood, max 72 characters, no trailing period.\n" +
+  "- Describe the meaningful change, not implementation trivia. Never invent changes.\n" +
+  "- Return ONLY the commit message. No quotes, no markdown fences, no preamble, no explanation.";
+
+const BODY_RULES =
+  "\n- If the diff has more than one notable change, add a blank line after the subject, " +
+  "then a body of short '-' bullet points (one per change, wrap at 72 chars). " +
+  "If a single small change, return only the subject line.";
+
+const SUBJECT_ONLY_RULES =
+  "\n- Return exactly one line: the subject only. If multiple changes exist, pick the most significant one.";
 
 function secretKey(provider) {
   return `aiCommit.apiKey.${provider}`;
@@ -96,17 +102,27 @@ function getConfig() {
   return {
     provider: cfg.get("provider", "anthropic"),
     model: cfg.get("model", "claude-opus-4-8"),
-    baseUrl: cfg.get("baseUrl", ""),
+    baseUrl: (cfg.get("baseUrl", "") || "").trim(),
+    includeBody: cfg.get("includeBody", true),
+    maxDiffChars: cfg.get("maxDiffChars", 60000),
   };
 }
 
+// ---------- setup ----------
+
 async function setup(context) {
-  const providerId = await vscode.window.showQuickPick(
-    Object.entries(PROVIDERS).map(([id, p]) => ({ label: p.label, id })),
+  const current = getConfig();
+  const providerPick = await vscode.window.showQuickPick(
+    Object.entries(PROVIDERS).map(([id, p]) => ({
+      label: p.label,
+      description: id === current.provider ? "current" : undefined,
+      id,
+    })),
     { placeHolder: "Select AI provider" }
   );
-  if (!providerId) return;
-  const provider = PROVIDERS[providerId.id];
+  if (!providerPick) return;
+  const providerId = providerPick.id;
+  const provider = PROVIDERS[providerId];
 
   let model;
   if (provider.models.length) {
@@ -116,131 +132,232 @@ async function setup(context) {
     );
     if (!pick) return;
     model = pick.startsWith("$(edit)")
-      ? await vscode.window.showInputBox({ prompt: "Model ID" })
+      ? await vscode.window.showInputBox({ prompt: "Model ID", ignoreFocusOut: true })
       : pick;
   } else {
-    model = await vscode.window.showInputBox({ prompt: "Model ID" });
+    model = await vscode.window.showInputBox({ prompt: "Model ID", ignoreFocusOut: true });
   }
   if (!model) return;
 
   const cfg = vscode.workspace.getConfiguration("aiCommit");
-  await cfg.update("provider", providerId.id, vscode.ConfigurationTarget.Global);
-  await cfg.update("model", model, vscode.ConfigurationTarget.Global);
+  await cfg.update("provider", providerId, vscode.ConfigurationTarget.Global);
+  await cfg.update("model", model.trim(), vscode.ConfigurationTarget.Global);
 
-  if (providerId.id === "custom" || providerId.id === "ollama") {
+  if (providerId === "custom" || providerId === "ollama") {
     const baseUrl = await vscode.window.showInputBox({
-      prompt: "Base URL (OpenAI-compatible)",
-      value: provider.baseUrl || "http://localhost:11434/v1",
+      prompt: "Base URL (OpenAI-compatible, ends with /v1)",
+      value: current.baseUrl || provider.baseUrl || "http://localhost:11434/v1",
+      ignoreFocusOut: true,
     });
     if (baseUrl === undefined) return;
-    await cfg.update("baseUrl", baseUrl, vscode.ConfigurationTarget.Global);
+    await cfg.update("baseUrl", baseUrl.trim(), vscode.ConfigurationTarget.Global);
   }
 
   if (provider.needsKey) {
+    const existing = await context.secrets.get(secretKey(providerId));
     const key = await vscode.window.showInputBox({
-      prompt: `API key for ${provider.label}`,
+      prompt: `API key for ${provider.label}${existing ? " (leave blank to keep existing)" : ""}`,
       password: true,
       ignoreFocusOut: true,
     });
-    if (key) await context.secrets.store(secretKey(providerId.id), key);
+    if (key === undefined) return;
+    if (key.trim()) await context.secrets.store(secretKey(providerId), key.trim());
   }
 
-  vscode.window.showInformationMessage(
-    `AI Commit: ${provider.label} / ${model} configured ✓`
-  );
+  vscode.window.showInformationMessage(`AI Commit: ${provider.label} / ${model} configured ✓`);
 }
 
-function getRepo() {
+// ---------- git ----------
+
+function getGitApi() {
   const gitExt = vscode.extensions.getExtension("vscode.git");
   if (!gitExt) throw new Error("Git extension not found");
-  const git = gitExt.exports.getAPI(1);
-  if (!git.repositories.length) throw new Error("No git repository open");
-  return git.repositories[0];
+  const exports = gitExt.isActive ? gitExt.exports : null;
+  if (!exports) throw new Error("Git extension not active yet, retry in a moment");
+  return exports.getAPI(1);
 }
 
-async function getDiff(repo) {
-  let diff = await repo.diff(true); // staged
-  if (!diff || !diff.trim()) diff = await repo.diff(false); // unstaged
-  if (!diff || !diff.trim()) {
-    // untracked-only case: list new files as context
-    const untracked = repo.state.workingTreeChanges
-      .map((c) => c.uri.fsPath)
-      .join("\n");
-    if (untracked) diff = "New untracked files:\n" + untracked;
+// `arg` is the SourceControl passed by VS Code when invoked from scm/title.
+async function pickRepo(arg) {
+  const git = getGitApi();
+  const repos = git.repositories;
+  if (!repos.length) throw new Error("No git repository open");
+  if (repos.length === 1) return repos[0];
+
+  const argRoot = arg?.rootUri?.toString();
+  if (argRoot) {
+    const match = repos.find((r) => r.rootUri.toString() === argRoot);
+    if (match) return match;
   }
-  if (!diff || !diff.trim()) throw new Error("No changes found to commit");
-  if (diff.length > MAX_DIFF_CHARS) {
-    diff = diff.slice(0, MAX_DIFF_CHARS) + "\n\n[diff truncated]";
+
+  const activeUri = vscode.window.activeTextEditor?.document?.uri;
+  if (activeUri) {
+    const match = repos.find((r) => activeUri.fsPath.startsWith(r.rootUri.fsPath));
+    if (match) return match;
   }
-  return diff;
-}
 
-async function callAnthropic(baseUrl, apiKey, model, prompt) {
-  const res = await fetch(`${baseUrl}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 300,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  const block = (data.content || []).find((b) => b.type === "text");
-  return block ? block.text : "";
-}
-
-async function callOpenAICompat(baseUrl, apiKey, model, prompt) {
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model,
-      max_tokens: 300,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
-}
-
-async function callGemini(baseUrl, apiKey, model, prompt) {
-  const res = await fetch(
-    `${baseUrl}/models/${model}:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 300 },
-      }),
-    }
+  const pick = await vscode.window.showQuickPick(
+    repos.map((r) => ({ label: r.rootUri.fsPath.split("/").pop(), description: r.rootUri.fsPath, repo: r })),
+    { placeHolder: "Select repository" }
   );
-  if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return pick?.repo;
 }
 
-function cleanMessage(text) {
-  let msg = (text || "").trim();
-  // strip markdown fences / quotes / thinking tags if a model adds them
-  msg = msg.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-  msg = msg.replace(/^```[a-z]*\n?|```$/g, "").trim();
-  msg = msg.replace(/^["'`]|["'`]$/g, "").trim();
-  return msg.split("\n")[0].trim();
+async function getDiff(repo, maxDiffChars) {
+  let diff = await repo.diff(true); // staged
+  let source = "staged";
+  if (!diff?.trim()) {
+    diff = await repo.diff(false); // unstaged
+    source = "unstaged";
+  }
+  if (!diff?.trim()) {
+    const untracked = repo.state.workingTreeChanges
+      .map((c) => vscode.workspace.asRelativePath(c.uri, false))
+      .join("\n");
+    if (untracked) {
+      diff = "New untracked files:\n" + untracked;
+      source = "untracked";
+    }
+  }
+  if (!diff?.trim()) throw new Error("No changes found to commit");
+  if (diff.length > maxDiffChars) {
+    diff = diff.slice(0, maxDiffChars) + "\n\n[diff truncated]";
+  }
+  return { diff, source };
 }
 
-async function generate(context) {
+// ---------- providers ----------
+
+async function postJson(url, headers, body, signal) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+    signal,
+  });
+  return res;
+}
+
+async function readError(res, label) {
+  let text = await res.text();
   try {
-    const { provider: providerId, model, baseUrl: baseUrlOverride } = getConfig();
+    const j = JSON.parse(text);
+    text = j.error?.message || j.message || text;
+  } catch {
+    /* plain text */
+  }
+  return new Error(`${label} ${res.status}: ${text.slice(0, 500)}`);
+}
+
+async function callAnthropic({ baseUrl, apiKey, model, system, user, signal }) {
+  const res = await postJson(
+    `${baseUrl}/v1/messages`,
+    { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    { model, max_tokens: MAX_TOKENS, system, messages: [{ role: "user", content: user }] },
+    signal
+  );
+  if (!res.ok) throw await readError(res, "Anthropic");
+  const data = await res.json();
+  return (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+}
+
+// OpenAI reasoning models (o-series, gpt-5) reject `max_tokens`; they want `max_completion_tokens`.
+function isOpenAIReasoningModel(providerId, model) {
+  return providerId === "openai" && /^(o\d|gpt-5)/.test(model);
+}
+
+async function callOpenAICompat({ providerId, baseUrl, apiKey, model, system, user, signal }) {
+  const headers = {};
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  if (providerId === "openrouter") headers["X-Title"] = "DiffCommit AI";
+
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+  const useCompletionTokens = isOpenAIReasoningModel(providerId, model);
+  if (useCompletionTokens) body.max_completion_tokens = MAX_TOKENS;
+  else {
+    body.max_tokens = MAX_TOKENS;
+    body.temperature = 0.2;
+  }
+
+  let res = await postJson(`${baseUrl}/chat/completions`, headers, body, signal);
+  if (!res.ok && res.status === 400 && !useCompletionTokens) {
+    // retry once for endpoints that only accept max_completion_tokens
+    const text = await res.clone().text();
+    if (/max_completion_tokens/.test(text)) {
+      delete body.max_tokens;
+      delete body.temperature;
+      body.max_completion_tokens = MAX_TOKENS;
+      res = await postJson(`${baseUrl}/chat/completions`, headers, body, signal);
+    }
+  }
+  if (!res.ok) throw await readError(res, PROVIDERS[providerId]?.label || "API");
+  const data = await res.json();
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content;
+  if (Array.isArray(content)) return content.map((p) => p.text || "").join("");
+  return content || "";
+}
+
+async function callGemini({ baseUrl, apiKey, model, system, user, signal }) {
+  const res = await postJson(
+    `${baseUrl}/models/${encodeURIComponent(model)}:generateContent`,
+    { "x-goog-api-key": apiKey },
+    {
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: [{ text: user }] }],
+      generationConfig: { maxOutputTokens: MAX_TOKENS, temperature: 0.2 },
+    },
+    signal
+  );
+  if (!res.ok) throw await readError(res, "Gemini");
+  const data = await res.json();
+  const parts = data.candidates?.[0]?.content?.parts || [];
+  return parts
+    .filter((p) => typeof p.text === "string" && !p.thought)
+    .map((p) => p.text)
+    .join("");
+}
+
+// ---------- message cleanup ----------
+
+function cleanMessage(text, includeBody) {
+  let msg = (text || "").replace(/\r\n?/g, "\n");
+  msg = msg.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  msg = msg.trim();
+
+  // unwrap a single fenced block
+  const fence = msg.match(/^```[\w-]*\n([\s\S]*?)\n?```$/);
+  if (fence) msg = fence[1].trim();
+
+  // drop a leading label like "Commit message:"
+  msg = msg.replace(/^(commit message|message)\s*:\s*\n?/i, "").trim();
+
+  // unwrap quotes only when the whole thing is one quoted line
+  if (!msg.includes("\n")) msg = msg.replace(/^(["'`])(.*)\1$/, "$2").trim();
+
+  let lines = msg.split("\n").map((l) => l.replace(/\s+$/, ""));
+  if (!includeBody) lines = lines.slice(0, 1);
+
+  // collapse 3+ blank lines, strip leading/trailing blanks
+  msg = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return msg;
+}
+
+// ---------- command ----------
+
+async function generate(context, arg) {
+  try {
+    const cfg = getConfig();
+    const providerId = cfg.provider;
     const provider = PROVIDERS[providerId];
     if (!provider) throw new Error(`Unknown provider: ${providerId}`);
 
@@ -250,35 +367,53 @@ async function generate(context) {
         `No API key set for ${provider.label}.`,
         "Set up now"
       );
-      if (choice === "Set up now") await setup(context);
-      apiKey = await context.secrets.get(secretKey(providerId));
-      if (provider.needsKey && !apiKey) return;
+      if (choice !== "Set up now") return;
+      await setup(context);
+      // provider may have changed during setup; re-run with fresh config
+      return generate(context, arg);
     }
 
-    const baseUrl = (baseUrlOverride && baseUrlOverride.trim()) || provider.baseUrl;
+    const baseUrl = (cfg.baseUrl || provider.baseUrl).replace(/\/+$/, "");
     if (!baseUrl) throw new Error("Base URL not set (aiCommit.baseUrl)");
 
-    const repo = getRepo();
-    const diff = await getDiff(repo);
-    const prompt = PROMPT + diff;
+    const repo = await pickRepo(arg);
+    if (!repo) return;
+    const { diff, source } = await getDiff(repo, cfg.maxDiffChars);
 
-    const message = await vscode.window.withProgress(
+    const system = SYSTEM_PROMPT + (cfg.includeBody ? BODY_RULES : SUBJECT_ONLY_RULES);
+    const user = `Diff (${source} changes):\n\n${diff}`;
+
+    const raw = await vscode.window.withProgress(
       {
-        location: vscode.ProgressLocation.SourceControl,
-        title: "Generating commit message...",
+        location: vscode.ProgressLocation.Notification,
+        title: `AI Commit: generating with ${cfg.model}...`,
+        cancellable: true,
       },
-      async () => {
-        if (provider.kind === "anthropic")
-          return callAnthropic(baseUrl, apiKey, model, prompt);
-        if (provider.kind === "gemini")
-          return callGemini(baseUrl, apiKey, model, prompt);
-        return callOpenAICompat(baseUrl, apiKey, model, prompt);
+      async (_progress, token) => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+        token.onCancellationRequested(() => ac.abort());
+        const args = { providerId, baseUrl, apiKey, model: cfg.model, system, user, signal: ac.signal };
+        try {
+          if (provider.kind === "anthropic") return await callAnthropic(args);
+          if (provider.kind === "gemini") return await callGemini(args);
+          return await callOpenAICompat(args);
+        } catch (err) {
+          if (err.name === "AbortError") {
+            if (token.isCancellationRequested) return null;
+            throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
+          }
+          throw err;
+        } finally {
+          clearTimeout(timer);
+        }
       }
     );
+    if (raw === null) return; // user cancelled
 
-    const clean = cleanMessage(message);
-    if (!clean) throw new Error("Model returned an empty message");
-    repo.inputBox.value = clean;
+    const message = cleanMessage(raw, cfg.includeBody);
+    if (!message) throw new Error("Model returned an empty message");
+    repo.inputBox.value = message;
   } catch (err) {
     vscode.window.showErrorMessage(`AI Commit: ${err.message}`);
   }
@@ -287,7 +422,7 @@ async function generate(context) {
 function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand("aiCommit.setup", () => setup(context)),
-    vscode.commands.registerCommand("aiCommit.generate", () => generate(context))
+    vscode.commands.registerCommand("aiCommit.generate", (arg) => generate(context, arg))
   );
 }
 

@@ -4,6 +4,21 @@
   "description": "Generate commit messages from git diff using AI — Claude, OpenAI, Gemini, DeepSeek, Grok, Mistral, Groq, OpenRouter, Ollama",
   "version": "0.0.1",
   "publisher": "vaibhava17",
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#1e1b4b",
+    "theme": "dark"
+  },
+  "keywords": [
+    "commit",
+    "git",
+    "ai",
+    "claude",
+    "openai",
+    "gemini",
+    "ollama",
+    "conventional commits"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -83,6 +98,17 @@
           "type": "string",
           "default": "",
           "description": "Override base URL. For Ollama defaults to http://localhost:11434. Required for provider 'custom'."
+        },
+        "aiCommit.includeBody": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow a multi-line body (bullet points) below the subject when the diff has several changes. Off = subject line only."
+        },
+        "aiCommit.maxDiffChars": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 1000,
+          "description": "Diff is truncated to this many characters before sending to the model."
         }
       }
     }
